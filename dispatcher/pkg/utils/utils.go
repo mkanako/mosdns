@@ -280,6 +280,17 @@ type parallelResult struct {
 	from Upstream
 }
 
+func setEdns0Padding(r *dns.Msg, str string) {
+	edns0 := r.IsEdns0()
+	if edns0 == nil {
+		r.SetEdns0(4096, false)
+		edns0 = r.IsEdns0()
+	}
+	paddingOpt := new(dns.EDNS0_PADDING)
+	paddingOpt.Padding = []byte(str)
+	edns0.Option = append(edns0.Option, paddingOpt)
+}
+
 func ExchangeParallel(ctx context.Context, qCtx *handler.Context, upstreams []Upstream, logger *zap.Logger) (r *dns.Msg, err error) {
 	t := len(upstreams)
 	if t == 0 {
@@ -292,6 +303,7 @@ func ExchangeParallel(ctx context.Context, qCtx *handler.Context, upstreams []Up
 			return nil, err
 		}
 		logger.Debug("response received", qCtx.InfoField(), zap.String("from", u.Address()))
+		setEdns0Padding(r, "from upstream: "+u.Address())
 		return r, nil
 	}
 
@@ -323,6 +335,7 @@ func ExchangeParallel(ctx context.Context, qCtx *handler.Context, upstreams []Up
 			}
 
 			logger.Debug("response received", qCtx.InfoField(), zap.String("from", res.from.Address()))
+			setEdns0Padding(res.r, "from upstream: "+res.from.Address())
 			return res.r, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
