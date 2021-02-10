@@ -26,3 +26,4 @@ require (
 )
 
 replace github.com/IrineSistiana/mosdns/dispatcher/plugin/check_network => ./dispatcher/plugin/check_network
+replace github.com/IrineSistiana/mosdns/dispatcher/plugin/lazy_cache => ./dispatcher/plugin/lazy_cache
