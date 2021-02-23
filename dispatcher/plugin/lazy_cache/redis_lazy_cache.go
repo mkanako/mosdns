@@ -23,25 +23,25 @@ func newRedisCache(url string) (*redisCache, error) {
 	return &redisCache{client: c}, nil
 }
 
-func (r *redisCache) get(ctx context.Context, key string) (v *dns.Msg, ttl uint32, expire int64, ok bool, err error) {
+func (r *redisCache) get(ctx context.Context, key string) (v *dns.Msg, ttl uint32, expire int64, err error) {
 	b, err := r.client.HGetAll(ctx, key).Result()
 	if err != nil {
 		if err == redis.Nil {
-			return nil, 0, 0, false, nil
+			return nil, 0, 0, nil
 		}
-		return nil, 0, 0, false, err
+		return nil, 0, 0, err
 	}
 	if len(b) == 0 {
-		return nil, 0, 0, false, nil
+		return nil, 0, 0, nil
 	}
 	data := new(CacheData)
 	mapstructure.WeakDecode(b, data)
 
 	v = new(dns.Msg)
 	if err := v.Unpack(data.Msg); err != nil {
-		return nil, 0, 0, false, err
+		return nil, 0, 0, err
 	}
-	return v, data.Ttl, data.Expire, true, nil
+	return v, data.Ttl, data.Expire, nil
 }
 
 func (r *redisCache) store(ctx context.Context, key string, v *dns.Msg, ttl uint32) (err error) {
@@ -61,4 +61,9 @@ func (r *redisCache) store(ctx context.Context, key string, v *dns.Msg, ttl uint
 	}
 	defer pool.ReleaseBuf(buf)
 	return r.client.HSet(ctx, key, data).Err()
+}
+
+// Close closes the redis client.
+func (r *redisCache) Close() error {
+	return r.client.Close()
 }

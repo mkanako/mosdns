@@ -3,6 +3,7 @@ package lazy_cache
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/dispatcher/handler"
@@ -23,7 +24,6 @@ func init() {
 }
 
 var _ handler.ESExecutablePlugin = (*cachePlugin)(nil)
-var _ handler.ContextPlugin = (*cachePlugin)(nil)
 
 type Args struct {
 	Size           int    `yaml:"size"`
@@ -40,9 +40,11 @@ type cachePlugin struct {
 type dnsCache interface {
 	// get retrieves v from cache. The returned v is a copy of the original msg
 	// that stored in the cache.
-	get(ctx context.Context, key string) (v *dns.Msg, ttl uint32, expire int64, ok bool, err error)
+	get(ctx context.Context, key string) (v *dns.Msg, ttl uint32, expire int64, err error)
 	// store stores the v into cache. It stores a copy of v.
 	store(ctx context.Context, key string, v *dns.Msg, ttl uint32) (err error)
+	// Closer closes the cache backend.
+	io.Closer
 }
 
 type CacheData struct {
@@ -76,48 +78,34 @@ func newCachePlugin(bp *handler.BP, args *Args) (*cachePlugin, error) {
 // ExecES searches the cache. If cache hits, earlyStop will be true.
 // It never returns an err. Because a cache fault should not terminate the query process.
 func (c *cachePlugin) ExecES(ctx context.Context, qCtx *handler.Context) (earlyStop bool, err error) {
-	key, cacheHit := c.searchAndReply(ctx, qCtx)
-	if cacheHit {
-		return true, nil
-	}
-
-	if len(key) != 0 {
-		de := newDeferStore(key, c)
-		qCtx.DeferExec(de)
-	}
-
-	return false, nil
-}
-
-func (c *cachePlugin) searchAndReply(ctx context.Context, qCtx *handler.Context) (key string, cacheHit bool) {
 	q := qCtx.Q()
 	key, err := utils.GetMsgKey(q, 0)
 	if err != nil {
-		c.L().Warn("unable to get msg key, skip it", qCtx.InfoField(), zap.Error(err))
-		return "", false
+		c.L().Warn("unable to get msg key", qCtx.InfoField(), zap.Error(err))
+		return false, nil
 	}
 
-	r, rawTtl, expire, isOk, err := c.c.get(ctx, key)
-	if isOk == false {
-		if err != nil {
-			c.L().Warn("unable to access cache, skip it", qCtx.InfoField(), zap.Error(err))
-		}
-		return key, false
+	// lookup in cache
+	r, rawTTL, expire, err := c.c.get(ctx, key)
+	if err != nil {
+		c.L().Warn("unable to access cache", qCtx.InfoField(), zap.Error(err))
+		return false, nil
 	}
 
-	if r != nil { // if cache hit
-		c.L().Debug("cache hit", qCtx.InfoField())
+	// cache hit
+	if r != nil {
 		r.Id = q.Id
+		c.L().Debug("cache hit", qCtx.InfoField())
 		ttl := expire - time.Now().Unix()
 		if ttl > 0 {
 			dnsutils.SetTTL(r, uint32(ttl))
 		} else {
 			if ttl*-1 > int64(maxExpire) {
-				c.L().Debug("cache expire and exceeds "+fmt.Sprint(maxExpire)+"s", qCtx.InfoField())
-				return key, false
+				c.L().Debug("cache expired and exceeds "+fmt.Sprint(maxExpire)+"s", qCtx.InfoField())
+				return false, nil
 			}
-			dnsutils.SetTTL(r, uint32(1))
-			c.L().Debug("cache expire", qCtx.InfoField(), zap.Uint32("rawTtl", rawTtl))
+			dnsutils.SetTTL(r, uint32(0))
+			c.L().Debug("cache expired", qCtx.InfoField(), zap.Uint32("rawTTL", rawTTL))
 			go func(ctx context.Context, qCtx *handler.Context) error {
 				p, err := handler.GetPlugin(c.args.UpdateSequence)
 				defer func() {
@@ -137,27 +125,27 @@ func (c *cachePlugin) searchAndReply(ctx context.Context, qCtx *handler.Context)
 			}(context.Background(), qCtx.Copy())
 		}
 		qCtx.SetResponse(r, handler.ContextStatusResponded)
-		return key, true
+		return true, nil
 	}
-	return key, false
+
+	// cache miss
+	qCtx.DeferExec(newDeferStore(key, c.c))
+	return false, nil
 }
 
 type deferCacheStore struct {
-	key string
-	p   *cachePlugin
+	key     string
+	backend dnsCache
 }
 
-func newDeferStore(key string, p *cachePlugin) *deferCacheStore {
-	return &deferCacheStore{key: key, p: p}
+func newDeferStore(key string, backend dnsCache) *deferCacheStore {
+	return &deferCacheStore{key: key, backend: backend}
 }
 
 // Exec caches the response.
 // It never returns an err. Because a cache fault should not terminate the query process.
 func (d *deferCacheStore) Exec(ctx context.Context, qCtx *handler.Context) (err error) {
-	if err := d.exec(ctx, qCtx); err != nil {
-		d.p.L().Warn("failed to cache the data", qCtx.InfoField(), zap.Error(err))
-	}
-	return nil
+	return runStore(ctx, d.backend, qCtx.R(), d.key)
 }
 
 func runStore(ctx context.Context, c dnsCache, r *dns.Msg, k string) (err error) {
@@ -168,27 +156,5 @@ func runStore(ctx context.Context, c dnsCache, r *dns.Msg, k string) (err error)
 		}
 		return c.store(ctx, k, r, ttl)
 	}
-	return nil
-}
-
-func (d *deferCacheStore) exec(ctx context.Context, qCtx *handler.Context) (err error) {
-	return runStore(ctx, d.p.c, qCtx.R(), d.key)
-}
-
-func (c *cachePlugin) Connect(ctx context.Context, qCtx *handler.Context, pipeCtx *handler.PipeContext) (err error) {
-	key, cacheHit := c.searchAndReply(ctx, qCtx)
-	if cacheHit {
-		return nil
-	}
-
-	err = pipeCtx.ExecNextPlugin(ctx, qCtx)
-	if err != nil {
-		return err
-	}
-
-	if len(key) != 0 {
-		_ = newDeferStore(key, c).Exec(ctx, qCtx)
-	}
-
 	return nil
 }
