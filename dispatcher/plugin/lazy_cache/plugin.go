@@ -102,6 +102,7 @@ func (c *cachePlugin) ExecES(ctx context.Context, qCtx *handler.Context) (earlyS
 		} else {
 			if ttl*-1 > int64(maxExpire) {
 				c.L().Debug("cache expired and exceeds "+fmt.Sprint(maxExpire)+"s", qCtx.InfoField())
+				qCtx.DeferExec(newDeferStore(key, c.c))
 				return false, nil
 			}
 			dnsutils.SetTTL(r, uint32(0))
